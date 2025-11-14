@@ -601,9 +601,26 @@ def login_and_get_session(config, email, password, proxies=None):
         # 使用session来保持cookie
         session = requests.Session()
 
+        # 设置完整的浏览器请求头，避免被识别为机器人
+        # 注意：不要手动设置Accept-Encoding，让requests自动处理压缩
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': f'{api_base}/auth/signin',
+            'Origin': api_base,
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+        }
+
         # 步骤0: 访问session接口获取初始cookies
         print(f"\n访问session接口...")
-        session_response = session.get(f"{api_base}/api/auth/session", proxies=proxies)
+        session_response = session.get(f"{api_base}/api/auth/session", proxies=proxies, headers=headers)
         print(f"✓ Session接口响应: {session_response.status_code}")
 
         # 如果session接口返回429，直接返回None
@@ -613,7 +630,7 @@ def login_and_get_session(config, email, password, proxies=None):
 
         # 步骤1: 获取CSRF token
         print(f"\n获取CSRF token...")
-        csrf_response = session.get(f"{api_base}/api/auth/csrf", proxies=proxies)
+        csrf_response = session.get(f"{api_base}/api/auth/csrf", proxies=proxies, headers=headers)
 
         # 检查CSRF接口状态码
         if csrf_response.status_code == 429:
@@ -626,10 +643,17 @@ def login_and_get_session(config, email, password, proxies=None):
 
         # 尝试解析JSON
         try:
+            # 先打印响应头，检查Content-Type和Content-Encoding
+            print(f"CSRF响应头: Content-Type={csrf_response.headers.get('Content-Type')}, Content-Encoding={csrf_response.headers.get('Content-Encoding')}")
+            print(f"CSRF响应状态: {csrf_response.status_code}")
+
             csrf_data = csrf_response.json()
-        except json.JSONDecodeError:
-            print(f"✗ CSRF响应无法解析为JSON")
-            print(f"响应内容: {csrf_response.text[:200]}")
+        except json.JSONDecodeError as e:
+            print(f"✗ CSRF响应无法解析为JSON: {e}")
+            print(f"响应内容类型: {type(csrf_response.content)}")
+            print(f"响应内容长度: {len(csrf_response.content)}")
+            print(f"响应文本前200字符: {csrf_response.text[:200]}")
+            print(f"响应原始内容前50字节: {csrf_response.content[:50]}")
             return None
 
         csrf_token = csrf_data.get('csrfToken')
@@ -652,10 +676,14 @@ def login_and_get_session(config, email, password, proxies=None):
         }
 
         # 使用session发送请求，自动携带所有cookies
+        # 更新请求头为表单提交格式
+        login_headers = headers.copy()
+        login_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+
         login_response = session.post(
             f"{api_base}/api/auth/callback/credentials",
             data=login_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            headers=login_headers,
             proxies=proxies
         )
         
@@ -688,9 +716,24 @@ def get_referral_stats(config, session_token, proxies=None):
         print(f"\n获取推荐统计...")
         cookies = {'__Secure-next-auth.session-token': session_token}
 
+        # 设置完整的浏览器请求头
+        # 注意：不要手动设置Accept-Encoding，让requests自动处理压缩
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': f'{api_base}/dashboard',
+            'Origin': api_base,
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+        }
+
         response = requests.get(
             f"{api_base}/api/referral/stats",
             cookies=cookies,
+            headers=headers,
             proxies=proxies
         )
 
@@ -1019,12 +1062,23 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
 
     # 步骤7: 登录获取session token和推荐码
     print("\n[步骤7] 登录获取推荐码...")
+
+    # 添加延迟，避免验证成功后立即登录触发429
+    login_delay = random.uniform(3, 6)
+    print(f"⏱️  等待 {login_delay:.1f} 秒后发起登录请求...")
+    time.sleep(login_delay)
+
     session_token = login_and_get_session(config, email, account_info['password'], proxies=proxies)
 
     referral_code = ''
     credits_earned = 0
 
     if session_token:
+        # 添加延迟，避免登录成功后立即请求推荐统计触发429
+        stats_delay = random.uniform(2, 4)
+        print(f"⏱️  等待 {stats_delay:.1f} 秒后获取推荐统计...")
+        time.sleep(stats_delay)
+
         referral_stats = get_referral_stats(config, session_token, proxies=proxies)
         if referral_stats:
             referral_code = referral_stats.get('referralCode', '')

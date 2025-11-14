@@ -42,12 +42,15 @@ class BrowserSession:
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--disable-dev-shm-usage',
-                        '--no-sandbox'
+                        '--no-sandbox',
+                        '--ignore-certificate-errors',  # 忽略证书错误
+                        '--ignore-ssl-errors'            # 忽略SSL错误
                     ]
                 )
 
-                # 创建浏览器上下文
+                # 创建浏览器上下文，忽略HTTPS证书错误
                 context = browser.new_context(
+                    ignore_https_errors=True,  # 重要：忽略HTTPS证书错误
                     viewport={'width': 1920, 'height': 1080},
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     locale='en-US',
