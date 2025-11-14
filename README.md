@@ -152,4 +152,6 @@ uv run main.py
 - `referral_pool.json`: 邀请码池数据 (启用邀请码池时)
 - `proxy_pool_state.json`: 代理池状态数据
 
+<div align="center">
 
+**如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！**
