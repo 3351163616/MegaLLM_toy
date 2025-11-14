@@ -606,10 +606,32 @@ def login_and_get_session(config, email, password, proxies=None):
         session_response = session.get(f"{api_base}/api/auth/session", proxies=proxies)
         print(f"✓ Session接口响应: {session_response.status_code}")
 
+        # 如果session接口返回429，直接返回None
+        if session_response.status_code == 429:
+            print(f"❌ Session接口遭遇429限流，跳过登录")
+            return None
+
         # 步骤1: 获取CSRF token
         print(f"\n获取CSRF token...")
         csrf_response = session.get(f"{api_base}/api/auth/csrf", proxies=proxies)
-        csrf_data = csrf_response.json()
+
+        # 检查CSRF接口状态码
+        if csrf_response.status_code == 429:
+            print(f"❌ CSRF接口遭遇429限流，跳过登录")
+            return None
+
+        if csrf_response.status_code != 200:
+            print(f"✗ CSRF接口返回错误: {csrf_response.status_code}")
+            return None
+
+        # 尝试解析JSON
+        try:
+            csrf_data = csrf_response.json()
+        except json.JSONDecodeError:
+            print(f"✗ CSRF响应无法解析为JSON")
+            print(f"响应内容: {csrf_response.text[:200]}")
+            return None
+
         csrf_token = csrf_data.get('csrfToken')
 
         if not csrf_token:
@@ -673,7 +695,13 @@ def get_referral_stats(config, session_token, proxies=None):
         )
 
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                print(f"✗ 推荐统计响应无法解析为JSON")
+                print(f"响应内容: {response.text[:200]}")
+                return None
+
             referral_code = data.get('referralCode')
             stats = data.get('stats', {})
             total_referred = stats.get('totalReferred', 0)
@@ -688,6 +716,9 @@ def get_referral_stats(config, session_token, proxies=None):
                 'creditsEarned': credits_earned,
                 'totalReferred': total_referred
             }
+        elif response.status_code == 429:
+            print(f"❌ 推荐统计接口遭遇429限流")
+            return None
         else:
             print(f"✗ 获取推荐统计失败: {response.status_code}")
             return None
