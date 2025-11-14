@@ -795,19 +795,23 @@ def get_random_referral_code(config):
     """从池中随机获取邀请码，如果池功能未启用或池为空则使用配置中的"""
     global REFERRAL_CODE_POOL, REFERRAL_POOL_ENABLED
 
+    # 优先使用邀请码池（如果启用且非空）
     if REFERRAL_POOL_ENABLED and REFERRAL_CODE_POOL:
         code = random.choice(REFERRAL_CODE_POOL)
         print(f"使用邀请码池中的邀请码: {code}")
         return code
-    else:
-        code = config.get('referral_code', '')
-        if code:
-            print(f"使用配置中的固定邀请码: {code}")
-        else:
-            print(f"⚠️  警告: 未配置邀请码!")
-            print(f"   请在 config.json 中设置 'referral_code' 或 'referral_pool.initial_codes'")
-            print(f"   否则注册可能会失败! 继续尝试...")
+
+    # 邀请码池为空或未启用，fallback到配置中的固定邀请码
+    code = config.get('referral_code', '')
+    if code:
+        print(f"使用配置中的固定邀请码: {code}")
         return code
+
+    # 两者都没有配置
+    print(f"⚠️  警告: 未配置邀请码!")
+    print(f"   请在 config.json 中设置 'referral_code' 或 'referral_pool.initial_codes'")
+    print(f"   否则注册可能会失败! 继续尝试...")
+    return ''
 
 
 def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
@@ -815,6 +819,13 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
     print("\n" + "="*60)
     print("开始新的注册流程")
     print("="*60)
+
+    # 添加任务启动时的随机延迟，避免所有任务同时开始
+    if task_id is not None:
+        import time
+        import random
+        startup_delay = random.uniform(0.5, 2)
+        time.sleep(startup_delay)
 
     # 获取代理
     proxies = None
@@ -874,7 +885,7 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
     # 添加随机延迟，避免并发请求被识别为攻击
     import time
     import random
-    delay = random.uniform(1, 3)
+    delay = random.uniform(5, 10)  # 增加到5-10秒
     print(f"⏱️  等待 {delay:.1f} 秒后发起注册请求...")
     time.sleep(delay)
 
@@ -1080,12 +1091,18 @@ def main():
             print("="*60)
 
             with ThreadPoolExecutor(max_workers=concurrent_tasks) as executor:
-                # 提交任务
+                # 提交任务，添加随机延迟避免同时发起请求
                 futures = []
                 for i in range(concurrent_tasks):
                     task_counter += 1
                     future = executor.submit(concurrent_register_task, task_counter)
                     futures.append(future)
+
+                    # 在任务之间添加随机延迟(除了最后一个任务)
+                    if i < concurrent_tasks - 1:
+                        delay = random.uniform(8, 15)  # 增加到8-15秒
+                        print(f"⏱️  任务间隔延迟 {delay:.1f} 秒...")
+                        time.sleep(delay)
 
                 # 等待所有任务完成
                 for future in as_completed(futures):

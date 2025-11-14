@@ -1,11 +1,28 @@
 """
 浏览器自动化处理模块
 用于绕过 Vercel Security Checkpoint 等安全验证
+使用 Patchright (Playwright 的反检测版本)
 """
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+try:
+    # 优先使用 Patchright (Playwright 的反检测版本)
+    from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    USING_PATCHRIGHT = True
+    print("✅ 使用 Patchright (Playwright 反检测版本)")
+except ImportError:
+    # 回退到标准 playwright
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+        USING_PATCHRIGHT = False
+        print("⚠️  使用标准 Playwright (建议安装 Patchright: pip install patchright)")
+    except ImportError:
+        print("❌ 未安装 Playwright 或 Patchright!")
+        print("   请运行: pip install patchright")
+        raise
+
 import time
 import json
+import random
 
 
 class BrowserSession:
@@ -34,71 +51,112 @@ class BrowserSession:
         with sync_playwright() as p:
             browser = None
             try:
-                # 启动浏览器
+                # 启动浏览器 - Patchright 已内置最佳反检测配置
+                # 只需要最基本的参数，Patchright 会自动处理其他的
                 browser = p.chromium.launch(
-                    headless=self.headless,
-                    proxy={"server": self.clash_proxy},
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox'
-                    ]
+                    headless=self.headless,  # 支持 headless 模式（Patchright 已修复检测）
+                    proxy={"server": self.clash_proxy}
+                    # Patchright 自动添加的参数:
+                    # - 移除 --enable-automation
+                    # - 移除 --disable-popup-blocking
+                    # - 移除 --disable-component-update
+                    # - 移除 --disable-default-apps
+                    # - 移除 --disable-extensions
+                    # - 添加 --disable-blink-features=AutomationControlled
                 )
+
+                # 随机User-Agent列表 (模拟不同的浏览器)
+                user_agents = [
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ]
+                selected_ua = random.choice(user_agents)
 
                 # 创建浏览器上下文
                 context = browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    user_agent=selected_ua,
                     locale='en-US',
                     timezone_id='America/New_York'
                 )
 
-                # 注入反检测脚本
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
+                # Patchright 已经内置了所有必要的反检测补丁
+                # 不需要手动注入脚本！
+                # Patchright 自动处理:
+                # - Runtime.enable Leak (最重要的补丁)
+                # - Console.enable Leak
+                # - navigator.webdriver 修复
+                # - Command Flags 优化
+                # - 所有 Playwright 特征隐藏
+
+                # 可选: 添加额外的自定义脚本（如果需要）
+                # context.add_init_script("""
+                #     // 你的自定义脚本
+                # """)
 
                 page = context.new_page()
 
                 print(f"{log_prefix}📡 正在访问 {self.api_base}...")
 
                 # 访问首页触发验证
-                page.goto(self.api_base, wait_until='domcontentloaded', timeout=self.timeout)
+                page.goto(self.api_base, wait_until='networkidle', timeout=self.timeout)
+
+                print(f"{log_prefix}⏳ 等待 Vercel Security Checkpoint 验证...")
+                print(f"{log_prefix}   (这可能需要 10-30 秒，请耐心等待)")
 
                 # 等待验证完成的多种策略
                 verified = False
                 start_time = time.time()
-                max_wait = self.timeout / 1000  # 转换为秒
+                max_wait = 60  # 增加到 60 秒等待时间
 
                 while time.time() - start_time < max_wait:
                     current_url = page.url
+                    current_title = page.title()
 
-                    # 检查是否还在 checkpoint 页面
-                    if 'checkpoint' not in current_url.lower():
-                        print(f"{log_prefix}✅ 安全验证通过！")
+                    # 打印当前状态 (每5秒)
+                    elapsed = int(time.time() - start_time)
+                    if elapsed % 5 == 0 and elapsed > 0:
+                        print(f"{log_prefix}   ⏱️  已等待 {elapsed} 秒... (URL: {current_url[:50]}...)")
+
+                    # 检查页面标题是否不再是 checkpoint
+                    if 'checkpoint' not in current_title.lower() and 'verifying' not in current_title.lower():
+                        print(f"{log_prefix}✅ 安全验证通过！(标题: {current_title})")
                         verified = True
                         break
 
-                    # 检查页面内容是否有验证成功的标志
+                    # 检查 URL 是否已经跳转
+                    if 'checkpoint' not in current_url.lower():
+                        print(f"{log_prefix}✅ 安全验证通过！(URL 已跳转)")
+                        verified = True
+                        break
+
+                    # 检查页面内容
                     try:
-                        # 检查是否加载了正常页面内容
-                        page.wait_for_selector('body', timeout=1000)
                         body_text = page.text_content('body')
 
-                        if body_text and 'verifying your browser' not in body_text.lower():
-                            print(f"{log_prefix}✅ 页面内容验证通过！")
-                            verified = True
-                            break
+                        # 如果页面内容包含正常内容 (不是验证页面)
+                        if body_text:
+                            if 'verifying your browser' not in body_text.lower() and \
+                               'security checkpoint' not in body_text.lower() and \
+                               len(body_text) > 500:  # 正常页面内容应该更长
+                                print(f"{log_prefix}✅ 页面内容验证通过！")
+                                verified = True
+                                break
                     except:
                         pass
 
                     # 等待一小段时间再检查
-                    time.sleep(0.5)
+                    time.sleep(1)
 
                 if not verified:
-                    print(f"{log_prefix}⚠️  验证超时，尝试继续获取 cookies...")
+                    print(f"{log_prefix}❌ 验证超时 (等待了 {int(time.time() - start_time)} 秒)")
+                    print(f"{log_prefix}   当前标题: {page.title()}")
+                    print(f"{log_prefix}   当前 URL: {page.url}")
+                    print(f"{log_prefix}   这说明 Vercel 仍然检测到了自动化特征！")
+                    return {}
 
                 # 额外等待确保所有 cookies 设置完成
                 print(f"{log_prefix}⏱️  等待 cookies 设置完成...")
