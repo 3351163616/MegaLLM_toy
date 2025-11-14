@@ -13,7 +13,7 @@
   "proxy_pool": {
     "health_check_interval": 300,
     "max_failures": 3,
-    "concurrent_tasks": 5,
+    "concurrent_tasks": 5, //最大并发数，尽量不要设置太高
     "test_url": "http://www.gstatic.com/generate_204"
   },
   "referral_pool": {

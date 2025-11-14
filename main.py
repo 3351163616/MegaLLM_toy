@@ -530,8 +530,30 @@ def verify_email(config, email, otp, proxies=None, cookies=None):
     print(f"  邮箱: {email}")
     print(f"  验证码: {otp}")
 
+    # 调试: 显示 cookies 信息
+    if cookies:
+        print(f"  使用 Cookies: {len(cookies)} 个")
+        important_cookies = ['_vercel_jwt', '__vercel_live_token', 'vercel-checkpoint']
+        for key in important_cookies:
+            if key in cookies:
+                print(f"    - {key}: 已设置")
+    else:
+        print(f"  ⚠️  未使用 Cookies")
+
+    # 设置请求头
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+
+    # 使用 session 来管理 cookies (与 signup_account 保持一致)
+    session = requests.Session()
+    if cookies:
+        session.cookies.update(cookies)
+
     try:
-        response = requests.post(verify_url, json=payload, proxies=proxies, cookies=cookies)
+        response = session.post(verify_url, json=payload, proxies=proxies, headers=headers, timeout=30)
         
         print(f"\n响应状态码: {response.status_code}")
         
@@ -719,12 +741,24 @@ def load_referral_pool(config):
     if os.path.exists(REFERRAL_POOL_FILE):
         try:
             with open(REFERRAL_POOL_FILE, 'r', encoding='utf-8') as f:
-                saved_codes = json.load(f)
+                content = f.read().strip()
+                if not content:
+                    # 文件为空，使用初始邀请码
+                    saved_codes = []
+                    print(f"⚠ 本地邀请码池文件为空，使用初始邀请码")
+                else:
+                    saved_codes = json.loads(content)
+                    print(f"✓ 已从本地加载邀请码")
+
                 # 合并初始码和已保存的码，去重
                 REFERRAL_CODE_POOL = list(set(REFERRAL_CODE_POOL + saved_codes))
-            print(f"✓ 已从本地加载邀请码，当前邀请码池包含 {len(REFERRAL_CODE_POOL)} 个邀请码")
+            print(f"✓ 当前邀请码池包含 {len(REFERRAL_CODE_POOL)} 个邀请码")
+        except json.JSONDecodeError as e:
+            print(f"⚠ 邀请码池文件格式错误: {e}，使用初始邀请码")
+            # 保持使用初始邀请码
         except Exception as e:
-            print(f"⚠ 加载本地邀请码池失败: {e}")
+            print(f"⚠ 加载本地邀请码池失败: {e}，使用初始邀请码")
+            # 保持使用初始邀请码
     else:
         print(f"本地无邀请码池文件，使用初始邀请码: {len(REFERRAL_CODE_POOL)} 个")
 
@@ -767,7 +801,12 @@ def get_random_referral_code(config):
         return code
     else:
         code = config.get('referral_code', '')
-        print(f"使用配置中的固定邀请码: {code}")
+        if code:
+            print(f"使用配置中的固定邀请码: {code}")
+        else:
+            print(f"⚠️  警告: 未配置邀请码!")
+            print(f"   请在 config.json 中设置 'referral_code' 或 'referral_pool.initial_codes'")
+            print(f"   否则注册可能会失败! 继续尝试...")
         return code
 
 
@@ -831,21 +870,33 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
 
     # 步骤3: 注册账号
     print("\n[步骤3] 注册账号...")
+
+    # 添加随机延迟，避免并发请求被识别为攻击
+    import time
+    import random
+    delay = random.uniform(1, 3)
+    print(f"⏱️  等待 {delay:.1f} 秒后发起注册请求...")
+    time.sleep(delay)
+
     account_info = signup_account(config, email, referral_code, proxies=proxies, cookies=cookies)
 
     # 检查是否需要浏览器验证
     if not account_info['success']:
         if account_info.get('need_browser_verification') and cookie_manager:
-            print("\n🔄 检测到需要浏览器验证，重新获取 cookies 后重试...")
-            # 清除旧的 cookies
-            cookie_manager.clear_cookies(current_proxy)
-            # 强制重新获取
-            browser_session = BrowserSession(config)
-            cookies = browser_session.get_verified_session(current_proxy)
-            if cookies:
-                cookie_manager.set_cookies(cookies, current_proxy)
-                # 重试注册
-                account_info = signup_account(config, email, referral_code, proxies=proxies, cookies=cookies)
+            print("\n❌ 遭遇 Vercel 安全拦截 (429 Too Many Requests)")
+            print("📊 原因分析:")
+            print("   1. 当前代理 IP 可能已被 Vercel 标记为可疑")
+            print("   2. 即使重新获取 cookies，同一 IP 短时间内重试仍会被拦截")
+            print("   3. 需要更长的冷却时间或切换到全新的 IP")
+            print("\n🔄 策略：放弃当前代理，等待下一批次使用新代理重试")
+            print(f"   当前代理 [{current_proxy}] 将增加失败计数")
+
+            # 标记当前代理失败
+            if proxy_pool and current_proxy:
+                proxy_pool.mark_proxy_failed(current_proxy)
+
+            # 直接返回失败，不在同一代理上重试
+            return False
 
         if not account_info['success']:
             print("\n✗ 注册失败")
@@ -873,13 +924,57 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
 
     # 步骤6: 验证邮箱
     print("\n[步骤6] 验证邮箱...")
+
+    # 添加随机延迟，避免并发请求被识别为攻击
+    import time
+    import random
+    delay = random.uniform(1, 3)
+    print(f"⏱️  等待 {delay:.1f} 秒后发起验证请求...")
+    time.sleep(delay)
+
     verify_result = verify_email(config, email, verification_code, proxies=proxies, cookies=cookies)
 
     if not verify_result['success']:
-        print("\n✗ 邮箱验证失败")
-        if proxy_pool and current_proxy:
-            proxy_pool.mark_proxy_failed(current_proxy)
-        return False
+        # 检查是否需要浏览器验证(验证步骤)
+        if verify_result.get('need_browser_verification') and cookie_manager:
+            print("\n🔄 验证步骤检测到需要浏览器验证，重新获取 cookies 后重试...")
+
+            # 添加随机延迟，避免立即重试被识别
+            delay = random.uniform(3, 6)
+            print(f"⏱️  等待 {delay:.1f} 秒后重新获取 cookies...")
+            time.sleep(delay)
+
+            # 清除旧的 cookies
+            if current_proxy:
+                cookie_manager.clear_cookies(current_proxy)
+            else:
+                cookie_manager.clear_cookies()
+
+            # 重新获取浏览器 session
+            browser_session = BrowserSession(config)
+            cookies = browser_session.get_verified_session(current_proxy)
+
+            if cookies:
+                # 保存新的 cookies
+                if current_proxy:
+                    cookie_manager.set_cookies(cookies, current_proxy)
+                else:
+                    cookie_manager.set_cookies(cookies)
+
+                # 再次等待，避免连续请求
+                delay2 = random.uniform(2, 4)
+                print(f"⏱️  等待 {delay2:.1f} 秒后重试验证...")
+                time.sleep(delay2)
+
+                # 重试验证邮箱
+                print("🔄 使用新 cookies 重试验证...")
+                verify_result = verify_email(config, email, verification_code, proxies=proxies, cookies=cookies)
+
+        if not verify_result['success']:
+            print("\n✗ 邮箱验证失败")
+            if proxy_pool and current_proxy:
+                proxy_pool.mark_proxy_failed(current_proxy)
+            return False
 
     # 步骤7: 保存账号信息
     print("\n[步骤7] 保存账号信息...")

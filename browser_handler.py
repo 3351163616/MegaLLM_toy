@@ -101,13 +101,32 @@ class BrowserSession:
                     print(f"{log_prefix}⚠️  验证超时，尝试继续获取 cookies...")
 
                 # 额外等待确保所有 cookies 设置完成
-                time.sleep(2)
+                print(f"{log_prefix}⏱️  等待 cookies 设置完成...")
+                time.sleep(3)
 
-                # 获取 cookies
-                cookies = context.cookies()
+                # 尝试多次获取 cookies，有时需要等待
+                cookies = []
+                max_cookie_retries = 3
+                for attempt in range(max_cookie_retries):
+                    cookies = context.cookies()
+                    if cookies:
+                        break
+
+                    if attempt < max_cookie_retries - 1:
+                        print(f"{log_prefix}⏳ Cookie 获取尝试 {attempt + 1}/{max_cookie_retries} 失败，等待后重试...")
+                        time.sleep(2)
 
                 if not cookies:
-                    print(f"{log_prefix}⚠️  未获取到任何 cookies")
+                    print(f"{log_prefix}⚠️  未获取到任何 cookies (尝试了 {max_cookie_retries} 次)")
+
+                    # 调试: 打印当前 URL 和页面标题
+                    try:
+                        print(f"{log_prefix}🔍 调试信息:")
+                        print(f"{log_prefix}   当前 URL: {page.url}")
+                        print(f"{log_prefix}   页面标题: {page.title()}")
+                    except:
+                        pass
+
                     return {}
 
                 # 转换为 requests 可用格式
@@ -120,6 +139,33 @@ class BrowserSession:
                 for key in important_cookies:
                     if key in session_cookies:
                         print(f"{log_prefix}   - {key}: {session_cookies[key][:20]}...")
+
+                # 验证 cookies 是否真的有效（访问一个简单的 API 端点测试）
+                try:
+                    print(f"{log_prefix}🧪 验证 cookies 有效性...")
+
+                    # 先访问 session 端点
+                    response = page.goto(f"{self.api_base}/api/auth/session", wait_until='domcontentloaded', timeout=10000)
+
+                    # 检查是否被重定向回 checkpoint
+                    if response and 'checkpoint' not in page.url.lower():
+                        print(f"{log_prefix}✅ Cookies 通过 session 端点验证")
+
+                        # 再访问 csrf 端点，确保可以正常调用 API
+                        try:
+                            csrf_response = page.goto(f"{self.api_base}/api/auth/csrf", wait_until='domcontentloaded', timeout=10000)
+                            if csrf_response and csrf_response.status == 200:
+                                print(f"{log_prefix}✅ Cookies 通过 CSRF 端点验证")
+                            else:
+                                print(f"{log_prefix}⚠️  CSRF 端点访问异常: {csrf_response.status if csrf_response else 'None'}")
+                        except Exception as e:
+                            print(f"{log_prefix}⚠️  CSRF 端点验证失败: {e}")
+
+                    else:
+                        print(f"{log_prefix}⚠️  Cookies 可能无效（被重定向到 checkpoint）")
+                except Exception as e:
+                    print(f"{log_prefix}⚠️  Cookies 验证失败: {e}")
+                    # 继续返回 cookies，让后续流程决定是否可用
 
                 return session_cookies
 
@@ -197,8 +243,10 @@ class CookieManager:
     """Cookie 管理器，用于缓存和复用 cookies"""
 
     def __init__(self, cache_file='browser_cookies.json'):
+        import threading
         self.cache_file = cache_file
         self.cookies_cache = self._load_cache()
+        self.lock = threading.Lock()  # 添加线程锁防止并发冲突
 
     def _load_cache(self):
         """从文件加载缓存的 cookies"""
@@ -218,34 +266,38 @@ class CookieManager:
 
     def get_cookies(self, proxy_name=None):
         """获取指定代理的 cookies"""
-        key = proxy_name or 'default'
-        return self.cookies_cache.get(key, {})
+        with self.lock:
+            key = proxy_name or 'default'
+            return self.cookies_cache.get(key, {})
 
     def set_cookies(self, cookies, proxy_name=None):
         """设置指定代理的 cookies"""
-        key = proxy_name or 'default'
-        self.cookies_cache[key] = {
-            'cookies': cookies,
-            'timestamp': time.time()
-        }
-        self._save_cache()
+        with self.lock:
+            key = proxy_name or 'default'
+            self.cookies_cache[key] = {
+                'cookies': cookies,
+                'timestamp': time.time()
+            }
+            self._save_cache()
 
     def is_expired(self, proxy_name=None, max_age=3600):
         """检查 cookies 是否过期（默认 1 小时）"""
-        key = proxy_name or 'default'
-        if key not in self.cookies_cache:
-            return True
+        with self.lock:
+            key = proxy_name or 'default'
+            if key not in self.cookies_cache:
+                return True
 
-        cache_data = self.cookies_cache[key]
-        age = time.time() - cache_data.get('timestamp', 0)
-        return age > max_age
+            cache_data = self.cookies_cache[key]
+            age = time.time() - cache_data.get('timestamp', 0)
+            return age > max_age
 
     def clear_cookies(self, proxy_name=None):
         """清除指定代理的 cookies"""
-        key = proxy_name or 'default'
-        if key in self.cookies_cache:
-            del self.cookies_cache[key]
-            self._save_cache()
+        with self.lock:
+            key = proxy_name or 'default'
+            if key in self.cookies_cache:
+                del self.cookies_cache[key]
+                self._save_cache()
 
 
 if __name__ == '__main__':
