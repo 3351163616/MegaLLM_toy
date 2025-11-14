@@ -10,6 +10,7 @@ import json
 
 class BrowserSession:
     """处理需要浏览器验证的会话"""
+    api_base: object
 
     def __init__(self, config):
         self.config = config

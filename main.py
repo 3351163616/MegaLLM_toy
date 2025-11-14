@@ -671,46 +671,56 @@ def get_referral_stats(config, session_token, proxies=None):
             cookies=cookies,
             proxies=proxies
         )
-        
+
         if response.status_code == 200:
             data = response.json()
             referral_code = data.get('referralCode')
-            total_referred = data.get('stats', {}).get('totalReferred', 0)
-            
+            stats = data.get('stats', {})
+            total_referred = stats.get('totalReferred', 0)
+            credits_earned = stats.get('creditsEarned', 0)
+
             print(f"✓ 推荐码: {referral_code}")
             print(f"  总推荐人数: {total_referred}")
-            
-            return referral_code
+            print(f"  获得积分: {credits_earned}")
+
+            return {
+                'referralCode': referral_code,
+                'creditsEarned': credits_earned,
+                'totalReferred': total_referred
+            }
         else:
             print(f"✗ 获取推荐统计失败: {response.status_code}")
             return None
-            
+
     except Exception as e:
         print(f"✗ 获取推荐统计异常: {e}")
         return None
 
 
-def save_to_csv(email, password, api_key, csv_file='accounts.csv'):
+def save_to_csv(email, password, api_key, referral_code='', credits_earned=0, csv_file='accounts.csv'):
     """保存账号信息到CSV文件"""
     import csv
     import os
-    
+
     # 检查文件是否存在，如果不存在则创建并写入表头
     file_exists = os.path.isfile(csv_file)
-    
+
     with open(csv_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        
+
         # 如果文件不存在，先写入表头
         if not file_exists:
-            writer.writerow(['Email', 'Password', 'API Key', 'Created At'])
-        
+            writer.writerow(['Email', 'Password', 'API Key', 'Referral Code', 'Credits Earned', 'Created At'])
+
         # 写入账号信息
         from datetime import datetime
         created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        writer.writerow([email, password, api_key, created_at])
-    
+        writer.writerow([email, password, api_key, referral_code, credits_earned, created_at])
+
     print(f"\n✓ 账号信息已保存到 {csv_file}")
+    if referral_code:
+        print(f"  推荐码: {referral_code}")
+        print(f"  获得积分: {credits_earned}")
 
 
 # 全局邀请码池
@@ -976,26 +986,38 @@ def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
                 proxy_pool.mark_proxy_failed(current_proxy)
             return False
 
-    # 步骤7: 保存账号信息
-    print("\n[步骤7] 保存账号信息...")
-    save_to_csv(email, account_info['password'], verify_result['apiKey'])
-
-    # 步骤8: 登录获取session token并更新邀请码池
-    print("\n[步骤8] 登录获取推荐码...")
+    # 步骤7: 登录获取session token和推荐码
+    print("\n[步骤7] 登录获取推荐码...")
     session_token = login_and_get_session(config, email, account_info['password'], proxies=proxies)
 
+    referral_code = ''
+    credits_earned = 0
+
     if session_token:
-        new_referral_code = get_referral_stats(config, session_token, proxies=proxies)
-        if new_referral_code:
-            update_referral_pool(new_referral_code)
+        referral_stats = get_referral_stats(config, session_token, proxies=proxies)
+        if referral_stats:
+            referral_code = referral_stats.get('referralCode', '')
+            credits_earned = referral_stats.get('creditsEarned', 0)
+            # 更新邀请码池
+            if referral_code:
+                update_referral_pool(referral_code)
+        else:
+            print("⚠ 未能获取推荐统计信息")
     else:
-        print("⚠ 未能获取session token，跳过邀请码池更新")
+        print("⚠ 未能获取session token，跳过推荐码获取")
+
+    # 步骤8: 保存账号信息（包含推荐码和积分）
+    print("\n[步骤8] 保存账号信息...")
+    save_to_csv(email, account_info['password'], verify_result['apiKey'], referral_code, credits_earned)
 
     print("\n" + "="*60)
     print("✓ 注册流程成功完成!")
     print(f"  邮箱: {email}")
     print(f"  密码: {account_info['password']}")
     print(f"  API Key: {verify_result['apiKey']}")
+    if referral_code:
+        print(f"  推荐码: {referral_code}")
+        print(f"  获得积分: {credits_earned}")
     print("="*60)
 
     return True
