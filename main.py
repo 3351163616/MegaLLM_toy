@@ -4,6 +4,252 @@ import random
 import string
 import time
 import urllib.parse
+import threading
+import os
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+class ProxyPool:
+    """代理池管理类 - 基于 Clash API"""
+
+    PROXY_STATE_FILE = 'proxy_pool_state.json'
+
+    def __init__(self, config):
+        self.config = config
+        self.clash_api = config['clash']['api_url']
+        self.clash_secret = config['clash']['secret']
+        self.local_proxy = config['clash']['local_proxy']
+        self.max_failures = config['proxy_pool']['max_failures']
+        self.test_url = config['proxy_pool']['test_url']
+
+        self.proxies_dict = {
+            'http': self.local_proxy,
+            'https': self.local_proxy
+        }
+
+        # 节点列表和状态
+        self.all_proxies = []  # 所有节点名称列表
+        self.active_proxies = []  # 可用节点列表
+        self.failed_proxies = {}  # 失效节点: {name: failure_count}
+        self.lock = threading.Lock()  # 线程锁
+
+        # 加载节点和状态
+        self.load_proxies_from_clash_api()
+        self.load_state()
+
+        print(f"\n代理池初始化完成:")
+        print(f"  总节点数: {len(self.all_proxies)}")
+        print(f"  可用节点: {len(self.active_proxies)}")
+        print(f"  失效节点: {len(self.failed_proxies)}")
+
+    def load_proxies_from_clash_api(self):
+        """从 Clash API 加载节点列表"""
+        try:
+            headers = {'Authorization': f'Bearer {self.clash_secret}'}
+
+            # 获取所有代理信息
+            response = requests.get(f"{self.clash_api}/proxies", headers=headers, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                proxies_data = data.get('proxies', {})
+
+                # 获取GLOBAL选择器组的所有可用节点
+                global_proxy = proxies_data.get('GLOBAL', {})
+                available_nodes = global_proxy.get('all', [])
+
+                if available_nodes:
+                    # 过滤掉特殊节点（如DIRECT, REJECT等）和统计信息节点
+                    self.all_proxies = [
+                        node for node in available_nodes
+                        if node not in ['DIRECT', 'REJECT', 'GLOBAL', 'Proxy']
+                        and not node.startswith('剩余流量')
+                        and not node.startswith('套餐到期')
+                    ]
+                    print(f"✓ 从 Clash API 加载了 {len(self.all_proxies)} 个节点")
+                else:
+                    print("⚠ Clash API 未返回可用节点")
+                    self.all_proxies = []
+            else:
+                print(f"⚠ Clash API 请求失败，状态码: {response.status_code}")
+                self.all_proxies = []
+
+        except Exception as e:
+            print(f"⚠ 从 Clash API 加载节点失败: {e}")
+            self.all_proxies = []
+
+    def load_state(self):
+        """加载代理池状态"""
+        if os.path.exists(self.PROXY_STATE_FILE):
+            try:
+                with open(self.PROXY_STATE_FILE, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
+
+                self.failed_proxies = state.get('failed_proxies', {})
+
+                # 计算可用节点（排除失效节点）
+                self.active_proxies = [
+                    p for p in self.all_proxies
+                    if p not in self.failed_proxies
+                ]
+
+                print(f"✓ 已从本地加载代理池状态")
+            except Exception as e:
+                print(f"⚠ 加载代理池状态失败: {e}")
+                self.active_proxies = self.all_proxies.copy()
+        else:
+            # 首次运行，所有节点都是可用的
+            self.active_proxies = self.all_proxies.copy()
+
+    def save_state(self):
+        """保存代理池状态"""
+        try:
+            state = {
+                'failed_proxies': self.failed_proxies,
+                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            with open(self.PROXY_STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠ 保存代理池状态失败: {e}")
+
+    def switch_proxy(self, proxy_name):
+        """通过 Clash API 切换到指定节点"""
+        try:
+            headers = {'Authorization': f'Bearer {self.clash_secret}'}
+
+            # Clash API 切换节点的端点
+            # 首先需要获取默认的选择器组名（通常是 "GLOBAL" 或 "Proxy"）
+            selector_url = f"{self.clash_api}/proxies/GLOBAL"
+
+            # 切换节点
+            switch_url = f"{self.clash_api}/proxies/GLOBAL"
+            payload = {'name': proxy_name}
+
+            response = requests.put(switch_url, headers=headers, json=payload, timeout=5)
+
+            if response.status_code == 204:
+                print(f"✓ 已切换到节点: {proxy_name}")
+                return True
+            else:
+                print(f"⚠ 切换节点失败 [{response.status_code}]: {proxy_name}")
+                return False
+
+        except Exception as e:
+            print(f"⚠ 切换节点异常: {e}")
+            return False
+
+    def get_next_proxy(self):
+        """随机获取下一个可用代理"""
+        with self.lock:
+            if not self.active_proxies:
+                print("⚠ 没有可用节点！")
+                return None
+
+            # 随机选择
+            proxy_name = random.choice(self.active_proxies)
+
+            # 切换到该节点
+            if self.switch_proxy(proxy_name):
+                return proxy_name
+            else:
+                # 切换失败，标记失败并尝试下一个
+                self.mark_proxy_failed(proxy_name)
+                return self.get_next_proxy()  # 递归尝试下一个
+
+    def mark_proxy_failed(self, proxy_name):
+        """标记代理失败"""
+        with self.lock:
+            if proxy_name not in self.failed_proxies:
+                self.failed_proxies[proxy_name] = 0
+
+            self.failed_proxies[proxy_name] += 1
+
+            print(f"⚠ 节点 {proxy_name} 失败次数: {self.failed_proxies[proxy_name]}/{self.max_failures}")
+
+            # 如果超过最大失败次数，从活跃列表中移除
+            if self.failed_proxies[proxy_name] >= self.max_failures:
+                if proxy_name in self.active_proxies:
+                    self.active_proxies.remove(proxy_name)
+                    print(f"✗ 节点 {proxy_name} 已从活跃列表移除")
+                    self.save_state()
+
+    def check_proxy_health(self, proxy_name):
+        """检查单个代理的健康状态"""
+        try:
+            # 切换到指定节点
+            if not self.switch_proxy(proxy_name):
+                return False
+
+            # 等待切换生效
+            time.sleep(1)
+
+            # 测试连接
+            response = requests.get(
+                self.test_url,
+                proxies=self.proxies_dict,
+                timeout=10
+            )
+
+            if response.status_code in [200, 204]:
+                print(f"✓ 节点 {proxy_name} 健康检查通过")
+                return True
+            else:
+                print(f"✗ 节点 {proxy_name} 健康检查失败 [状态码: {response.status_code}]")
+                return False
+
+        except Exception as e:
+            print(f"✗ 节点 {proxy_name} 健康检查异常: {e}")
+            return False
+
+    def health_check_all(self):
+        """并发检查所有代理的健康状态"""
+        print("\n开始代理池健康检查(并发模式)...")
+
+        recovered = []  # 恢复的节点
+        all_nodes_to_check = self.active_proxies.copy() + list(self.failed_proxies.keys())
+
+        if not all_nodes_to_check:
+            print("没有需要检查的节点")
+            return
+
+        # 并发检查所有节点
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_proxy = {
+                executor.submit(self.check_proxy_health, proxy_name): proxy_name
+                for proxy_name in all_nodes_to_check
+            }
+
+            for future in as_completed(future_to_proxy):
+                proxy_name = future_to_proxy[future]
+                try:
+                    is_healthy = future.result()
+
+                    # 如果是活跃节点但检查失败
+                    if proxy_name in self.active_proxies and not is_healthy:
+                        self.mark_proxy_failed(proxy_name)
+
+                    # 如果是失效节点但检查通过,恢复它
+                    elif proxy_name in self.failed_proxies and is_healthy:
+                        with self.lock:
+                            del self.failed_proxies[proxy_name]
+                            if proxy_name not in self.active_proxies:
+                                self.active_proxies.append(proxy_name)
+                                recovered.append(proxy_name)
+
+                except Exception as e:
+                    print(f"✗ 检查节点 {proxy_name} 时发生异常: {e}")
+
+        if recovered:
+            print(f"\n✓ 恢复节点: {', '.join(recovered)}")
+
+        self.save_state()
+        print(f"\n健康检查完成 - 可用节点: {len(self.active_proxies)}/{len(self.all_proxies)}")
+
+    def get_proxies_dict(self):
+        """获取代理字典（用于 requests）"""
+        return self.proxies_dict
 
 
 def load_config():
@@ -12,17 +258,17 @@ def load_config():
         return json.load(f)
 
 
-def get_temp_email(config):
+def get_temp_email(config, proxies=None):
     """获取临时邮箱地址"""
     email_base = config['email_base']
     api_url = f"{email_base}/api/generate-email"
-    
+
     headers = {
         'Referer': f"{email_base}/"
     }
-    
+
     try:
-        response = requests.get(api_url, headers=headers)
+        response = requests.get(api_url, headers=headers, proxies=proxies)
         response.raise_for_status()
         data = response.json()
         
@@ -83,31 +329,34 @@ def generate_password():
     return ''.join(password_chars)
 
 
-def signup_account(config, email, referral_code, max_retries=5):
+def signup_account(config, email, referral_code, proxies=None):
     """注册账号，带重试机制"""
-    signup_url = "https://megallm.io/api/auth/signup"
-    
+    api_base = config.get('api_base', 'https://megallm.io')
+    signup_url = f"{api_base}/api/auth/signup"
+    max_retries = config.get('retry', {}).get('max_retries', 5)
+    retry_delay = config.get('retry', {}).get('retry_delay', 30)
+
     name = generate_name()
-    password = generate_password()
-    
+    password = config.get('account', {}).get('password', 'aA1472580369Z@')
+
     payload = {
         "name": name,
         "email": email,
         "password": password,
         "referralCode": referral_code
     }
-    
+
     print(f"\n注册信息:")
     print(f"  姓名: {name}")
     print(f"  邮箱: {email}")
     print(f"  密码: {password}")
     print(f"  邀请码: {referral_code}")
-    
+
     retry_count = 0
     while retry_count < max_retries:
         try:
             print(f"\n发起注册请求... (尝试 {retry_count + 1}/{max_retries})")
-            response = requests.post(signup_url, json=payload)
+            response = requests.post(signup_url, json=payload, proxies=proxies)
             
             print(f"响应状态码: {response.status_code}")
             
@@ -131,24 +380,24 @@ def signup_account(config, email, referral_code, max_retries=5):
                 print(f"\n✗ 状态码非200: {response.status_code}")
                 print(f"响应内容: {response.text}")
             
-            # 如果不是最后一次重试，等待1分钟后重试
+            # 如果不是最后一次重试，等待后重试
             retry_count += 1
             if retry_count < max_retries:
-                print(f"\n等待60秒后重试...")
-                time.sleep(60)
-            
+                print(f"\n等待{retry_delay}秒后重试...")
+                time.sleep(retry_delay)
+
         except requests.RequestException as e:
             print(f"\n请求异常: {e}")
             retry_count += 1
             if retry_count < max_retries:
-                print(f"\n等待60秒后重试...")
-                time.sleep(60)
+                print(f"\n等待{retry_delay}秒后重试...")
+                time.sleep(retry_delay)
         except json.JSONDecodeError as e:
             print(f"\nJSON解析失败: {e}")
             retry_count += 1
             if retry_count < max_retries:
-                print(f"\n等待60秒后重试...")
-                time.sleep(60)
+                print(f"\n等待{retry_delay}秒后重试...")
+                time.sleep(retry_delay)
     
     print(f"\n✗ 注册失败: 已达到最大重试次数 ({max_retries})")
     return {
@@ -159,28 +408,30 @@ def signup_account(config, email, referral_code, max_retries=5):
     }
 
 
-def poll_emails(config, email, timeout=600, poll_interval=5):
+def poll_emails(config, email, proxies=None):
     """轮询邮箱获取邮件列表"""
     email_base = config['email_base']
+    timeout = config.get('email_polling', {}).get('timeout', 600)
+    poll_interval = config.get('email_polling', {}).get('interval', 5)
     # URL编码邮箱地址，将@替换为%40
     encoded_email = urllib.parse.quote(email)
     api_url = f"{email_base}/api/emails?email={encoded_email}"
-    
+
     headers = {
         'Referer': f"{email_base}/"
     }
-    
+
     print(f"\n开始轮询邮箱，超时时间: {timeout}秒")
     print(f"轮询间隔: {poll_interval}秒")
-    
+
     start_time = time.time()
     attempt = 0
-    
+
     while time.time() - start_time < timeout:
         attempt += 1
         try:
             print(f"\n[尝试 {attempt}] 检查邮件...")
-            response = requests.get(api_url, headers=headers)
+            response = requests.get(api_url, headers=headers, proxies=proxies)
             response.raise_for_status()
             data = response.json()
             
@@ -241,21 +492,22 @@ def extract_verification_code(emails):
     return None
 
 
-def verify_email(config, email, otp):
+def verify_email(config, email, otp, proxies=None):
     """验证邮箱"""
-    verify_url = "https://megallm.io/api/auth/verify"
-    
+    api_base = config.get('api_base', 'https://megallm.io')
+    verify_url = f"{api_base}/api/auth/verify"
+
     payload = {
         "email": email,
         "otp": otp
     }
-    
+
     print(f"\n发起验证请求...")
     print(f"  邮箱: {email}")
     print(f"  验证码: {otp}")
-    
+
     try:
-        response = requests.post(verify_url, json=payload)
+        response = requests.post(verify_url, json=payload, proxies=proxies)
         
         print(f"\n响应状态码: {response.status_code}")
         
@@ -290,29 +542,31 @@ def verify_email(config, email, otp):
         return {"success": False}
 
 
-def login_and_get_session(email, password):
+def login_and_get_session(config, email, password, proxies=None):
     """登录并获取session token"""
+    api_base = config.get('api_base', 'https://megallm.io')
+
     try:
         # 使用session来保持cookie
         session = requests.Session()
-        
+
         # 步骤0: 访问session接口获取初始cookies
         print(f"\n访问session接口...")
-        session_response = session.get("https://megallm.io/api/auth/session")
+        session_response = session.get(f"{api_base}/api/auth/session", proxies=proxies)
         print(f"✓ Session接口响应: {session_response.status_code}")
-        
+
         # 步骤1: 获取CSRF token
         print(f"\n获取CSRF token...")
-        csrf_response = session.get("https://megallm.io/api/auth/csrf")
+        csrf_response = session.get(f"{api_base}/api/auth/csrf", proxies=proxies)
         csrf_data = csrf_response.json()
         csrf_token = csrf_data.get('csrfToken')
-        
+
         if not csrf_token:
             print("✗ 未能获取CSRF token")
             return None
-        
+
         print(f"✓ CSRF token: {csrf_token[:20]}...")
-        
+
         # 步骤2: 登录获取session token
         print(f"\n发起登录请求...")
         login_data = {
@@ -320,15 +574,16 @@ def login_and_get_session(email, password):
             'password': password,
             'redirect': 'false',
             'csrfToken': csrf_token,
-            'callbackUrl': 'https://megallm.io/auth/signin',
+            'callbackUrl': f'{api_base}/auth/signin',
             'json': 'true'
         }
-        
+
         # 使用session发送请求，自动携带所有cookies
         login_response = session.post(
-            "https://megallm.io/api/auth/callback/credentials",
+            f"{api_base}/api/auth/callback/credentials",
             data=login_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            proxies=proxies
         )
         
         print(f"登录响应状态码: {login_response.status_code}")
@@ -352,15 +607,18 @@ def login_and_get_session(email, password):
         return None
 
 
-def get_referral_stats(session_token):
+def get_referral_stats(config, session_token, proxies=None):
     """获取推荐统计信息"""
+    api_base = config.get('api_base', 'https://megallm.io')
+
     try:
         print(f"\n获取推荐统计...")
         cookies = {'__Secure-next-auth.session-token': session_token}
-        
+
         response = requests.get(
-            "https://megallm.io/api/referral/stats",
-            cookies=cookies
+            f"{api_base}/api/referral/stats",
+            cookies=cookies,
+            proxies=proxies
         )
         
         if response.status_code == 200:
@@ -407,29 +665,48 @@ def save_to_csv(email, password, api_key, csv_file='accounts.csv'):
 # 全局邀请码池
 REFERRAL_CODE_POOL = []
 REFERRAL_POOL_FILE = 'referral_pool.json'
+REFERRAL_POOL_ENABLED = False  # 邀请码池是否启用
 
 
-def load_referral_pool():
-    """从本地文件加载邀请码池"""
-    global REFERRAL_CODE_POOL
-    import os
-    
+def load_referral_pool(config):
+    """从配置和本地文件加载邀请码池"""
+    global REFERRAL_CODE_POOL, REFERRAL_POOL_ENABLED
+
+    # 检查是否启用邀请码池功能
+    referral_pool_config = config.get('referral_pool', {})
+    REFERRAL_POOL_ENABLED = referral_pool_config.get('enabled', False)
+
+    if not REFERRAL_POOL_ENABLED:
+        print("⚠ 邀请码池功能已禁用，将使用配置中的固定邀请码")
+        return
+
+    print("✓ 邀请码池功能已启用")
+
+    # 加载初始邀请码
+    initial_codes = referral_pool_config.get('initial_codes', [])
+    REFERRAL_CODE_POOL = initial_codes.copy()
+
+    # 从本地文件加载已保存的邀请码
     if os.path.exists(REFERRAL_POOL_FILE):
         try:
             with open(REFERRAL_POOL_FILE, 'r', encoding='utf-8') as f:
-                REFERRAL_CODE_POOL = json.load(f)
-            print(f"✓ 已从本地加载 {len(REFERRAL_CODE_POOL)} 个邀请码")
+                saved_codes = json.load(f)
+                # 合并初始码和已保存的码，去重
+                REFERRAL_CODE_POOL = list(set(REFERRAL_CODE_POOL + saved_codes))
+            print(f"✓ 已从本地加载邀请码，当前邀请码池包含 {len(REFERRAL_CODE_POOL)} 个邀请码")
         except Exception as e:
-            print(f"⚠ 加载邀请码池失败: {e}")
-            REFERRAL_CODE_POOL = []
+            print(f"⚠ 加载本地邀请码池失败: {e}")
     else:
-        print("本地无邀请码池文件，将使用配置中的默认邀请码")
-        REFERRAL_CODE_POOL = []
+        print(f"本地无邀请码池文件，使用初始邀请码: {len(REFERRAL_CODE_POOL)} 个")
 
 
 def save_referral_pool():
     """将邀请码池保存到本地文件"""
-    global REFERRAL_CODE_POOL
+    global REFERRAL_CODE_POOL, REFERRAL_POOL_ENABLED
+
+    if not REFERRAL_POOL_ENABLED:
+        return
+
     try:
         with open(REFERRAL_POOL_FILE, 'w', encoding='utf-8') as f:
             json.dump(REFERRAL_CODE_POOL, f, ensure_ascii=False, indent=2)
@@ -440,7 +717,11 @@ def save_referral_pool():
 
 def update_referral_pool(new_code):
     """更新邀请码池并保存到本地"""
-    global REFERRAL_CODE_POOL
+    global REFERRAL_CODE_POOL, REFERRAL_POOL_ENABLED
+
+    if not REFERRAL_POOL_ENABLED:
+        return
+
     if new_code and new_code not in REFERRAL_CODE_POOL:
         REFERRAL_CODE_POOL.append(new_code)
         print(f"\n✓ 邀请码池已更新，当前包含 {len(REFERRAL_CODE_POOL)} 个邀请码")
@@ -448,90 +729,114 @@ def update_referral_pool(new_code):
 
 
 def get_random_referral_code(config):
-    """从池中随机获取邀请码，如果池为空则使用配置中的"""
-    global REFERRAL_CODE_POOL
-    if REFERRAL_CODE_POOL:
+    """从池中随机获取邀请码，如果池功能未启用或池为空则使用配置中的"""
+    global REFERRAL_CODE_POOL, REFERRAL_POOL_ENABLED
+
+    if REFERRAL_POOL_ENABLED and REFERRAL_CODE_POOL:
         code = random.choice(REFERRAL_CODE_POOL)
         print(f"使用邀请码池中的邀请码: {code}")
         return code
     else:
         code = config.get('referral_code', '')
-        print(f"使用配置中的默认邀请码: {code}")
+        print(f"使用配置中的固定邀请码: {code}")
         return code
 
 
-def register_once(config):
+def register_once(config, proxy_pool=None, task_id=None):
     """执行一次完整的注册流程"""
     print("\n" + "="*60)
     print("开始新的注册流程")
     print("="*60)
-    
+
+    # 获取代理
+    proxies = None
+    current_proxy = None
+    if proxy_pool:
+        current_proxy = proxy_pool.get_next_proxy()
+        if current_proxy:
+            proxies = proxy_pool.get_proxies_dict()
+            # 功能1: 显示当前使用的节点
+            if task_id is not None:
+                print(f"[任务 {task_id}] 当前使用节点: {current_proxy}")
+            else:
+                print(f"使用代理节点: {current_proxy}")
+        else:
+            print("⚠ 无可用代理，将不使用代理")
+
     # 步骤1: 获取邀请码
     print("\n[步骤1] 获取邀请码...")
     referral_code = get_random_referral_code(config)
-    
+
     # 步骤2: 获取临时邮箱
     print("\n[步骤2] 获取临时邮箱...")
-    email = get_temp_email(config)
-    
+    email = get_temp_email(config, proxies=proxies)
+
     if not email:
         print("✗ 获取邮箱失败")
+        if proxy_pool and current_proxy:
+            proxy_pool.mark_proxy_failed(current_proxy)
         return False
-    
+
     # 步骤3: 注册账号
     print("\n[步骤3] 注册账号...")
-    account_info = signup_account(config, email, referral_code)
-    
+    account_info = signup_account(config, email, referral_code, proxies=proxies)
+
     if not account_info['success']:
         print("\n✗ 注册失败")
+        if proxy_pool and current_proxy:
+            proxy_pool.mark_proxy_failed(current_proxy)
         return False
-    
+
     # 步骤4: 轮询邮箱获取验证码
     print("\n[步骤4] 轮询邮箱获取验证码...")
-    emails = poll_emails(config, email, timeout=600, poll_interval=5)
-    
+    emails = poll_emails(config, email, proxies=proxies, timeout=600, poll_interval=5)
+
     if not emails:
         print("\n✗ 未收到验证邮件")
+        if proxy_pool and current_proxy:
+            proxy_pool.mark_proxy_failed(current_proxy)
         return False
-    
+
     # 步骤5: 提取验证码
     print("\n[步骤5] 提取验证码...")
     verification_code = extract_verification_code(emails)
-    
+
     if not verification_code:
         print("\n✗ 未能提取验证码")
         return False
-    
+
     # 步骤6: 验证邮箱
     print("\n[步骤6] 验证邮箱...")
-    verify_result = verify_email(config, email, verification_code)
-    
+    verify_result = verify_email(config, email, verification_code, proxies=proxies)
+
     if not verify_result['success']:
         print("\n✗ 邮箱验证失败")
+        if proxy_pool and current_proxy:
+            proxy_pool.mark_proxy_failed(current_proxy)
         return False
-    
+
     # 步骤7: 保存账号信息
     print("\n[步骤7] 保存账号信息...")
     save_to_csv(email, account_info['password'], verify_result['apiKey'])
-    
+
     # 步骤8: 登录获取session token并更新邀请码池
     print("\n[步骤8] 登录获取推荐码...")
-    session_token = login_and_get_session(email, account_info['password'])
-    
+    session_token = login_and_get_session(config, email, account_info['password'], proxies=proxies)
+
     if session_token:
-        new_referral_code = get_referral_stats(session_token)
+        new_referral_code = get_referral_stats(config, session_token, proxies=proxies)
         if new_referral_code:
             update_referral_pool(new_referral_code)
     else:
         print("⚠ 未能获取session token，跳过邀请码池更新")
-    
+
     print("\n" + "="*60)
     print("✓ 注册流程成功完成!")
     print(f"  邮箱: {email}")
     print(f"  密码: {account_info['password']}")
     print(f"  API Key: {verify_result['apiKey']}")
     print("="*60)
-    
+
     return True
 
 
@@ -539,45 +844,104 @@ def main():
     print("="*60)
     print("自动注册机启动")
     print("="*60)
-    
+
     # 加载配置
     config = load_config()
-    
+
     # 加载本地邀请码池
-    print("\n加载邀请码池...")
-    load_referral_pool()
-    
+    print("\n加载邀请码池配置...")
+    load_referral_pool(config)
+
+    # 初始化代理池
+    print("\n初始化代理池...")
+    proxy_pool = ProxyPool(config)
+
+    # 启动前健康检查
+    print("\n执行启动前代理健康检查...")
+    proxy_pool.health_check_all()
+
+    if not proxy_pool.active_proxies:
+        print("\n✗ 没有可用的代理节点，程序退出")
+        return
+
+    # 获取并发任务数
+    concurrent_tasks = config.get('proxy_pool', {}).get('concurrent_tasks', 5)
+    health_check_interval = config.get('proxy_pool', {}).get('health_check_interval', 300)
+
+    print(f"\n并发配置:")
+    print(f"  并发任务数: {concurrent_tasks}")
+    print(f"  健康检查间隔: {health_check_interval}秒")
+
+    # 统计信息
     success_count = 0
     fail_count = 0
-    
-    # 循环注册
-    while True:
+    last_health_check = time.time()
+
+    # 定义单个并发任务
+    def concurrent_register_task(task_id):
+        """单个并发注册任务"""
+        print(f"\n[任务 {task_id}] 开始执行...")
         try:
-            result = register_once(config)
-            
-            if result:
-                success_count += 1
-                print(f"\n当前统计: 成功 {success_count} 次, 失败 {fail_count} 次")
-            else:
-                fail_count += 1
-                print(f"\n当前统计: 成功 {success_count} 次, 失败 {fail_count} 次")
-                print("等待30秒后重试...")
-                time.sleep(30)
-            
-            # 成功后短暂等待，避免请求过快
-            if result:
-                print("\n等待30秒后进行下一次注册...")
-                time.sleep(30)
-                
-        except KeyboardInterrupt:
-            print("\n\n用户中断，程序退出")
-            print(f"最终统计: 成功 {success_count} 次, 失败 {fail_count} 次")
-            break
+            result = register_once(config, proxy_pool=proxy_pool, task_id=task_id)
+            return (task_id, result)
         except Exception as e:
-            fail_count += 1
-            print(f"\n✗ 发生异常: {e}")
-            print("等待30秒后重试...")
+            print(f"\n[任务 {task_id}] 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return (task_id, False)
+
+    # 并发执行循环
+    task_counter = 0
+
+    try:
+        while True:
+            # 检查是否需要进行健康检查
+            if time.time() - last_health_check > health_check_interval:
+                print("\n" + "="*60)
+                print("执行定时健康检查...")
+                print("="*60)
+                proxy_pool.health_check_all()
+                last_health_check = time.time()
+
+            # 使用线程池并发执行注册任务
+            print("\n" + "="*60)
+            print(f"启动并发批次 - 并发数: {concurrent_tasks}")
+            print("="*60)
+
+            with ThreadPoolExecutor(max_workers=concurrent_tasks) as executor:
+                # 提交任务
+                futures = []
+                for i in range(concurrent_tasks):
+                    task_counter += 1
+                    future = executor.submit(concurrent_register_task, task_counter)
+                    futures.append(future)
+
+                # 等待所有任务完成
+                for future in as_completed(futures):
+                    task_id, result = future.result()
+
+                    if result:
+                        success_count += 1
+                        print(f"\n[任务 {task_id}] ✓ 成功")
+                    else:
+                        fail_count += 1
+                        print(f"\n[任务 {task_id}] ✗ 失败")
+
+                    print(f"当前统计: 成功 {success_count} 次, 失败 {fail_count} 次")
+
+            # 并发批次完成，等待一段时间再开始下一批次
+            print("\n等待30秒后进行下一批次...")
             time.sleep(30)
+
+    except KeyboardInterrupt:
+        print("\n\n用户中断，程序退出")
+        print(f"\n最终统计: 成功 {success_count} 次, 失败 {fail_count} 次")
+        print(f"代理池状态: 可用节点 {len(proxy_pool.active_proxies)}/{len(proxy_pool.all_proxies)}")
+    except Exception as e:
+        print(f"\n✗ 主程序异常: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"\n最终统计: 成功 {success_count} 次, 失败 {fail_count} 次")
 
 
 if __name__ == "__main__":

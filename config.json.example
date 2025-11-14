@@ -1,0 +1,33 @@
+{
+  "email_base": "https://mail.chatgpt.org.uk",
+  "referral_code": "", //填你的主账号邀请码
+  "api_base": "https://megallm.io",
+  "account": {
+    "password": "your-password" //可以设置注册的所有账号为固定密码
+  },
+  "clash": {
+    "api_url": "http://127.0.0.1:9097",  //改成你自己clash的API
+    "secret": "your-clash-secret",
+    "local_proxy": "http://127.0.0.1:7897"
+  },
+  "proxy_pool": {
+    "health_check_interval": 300,
+    "max_failures": 3,
+    "concurrent_tasks": 20,
+    "test_url": "http://www.gstatic.com/generate_204"
+  },
+  "referral_pool": {
+    "enabled": true, //是否启用邀请码池
+    "initial_codes": []
+  },
+  "retry": {
+    "max_retries": 5,
+    "retry_delay": 60
+  },
+  "email_polling": {
+    "timeout": 600,
+    "interval": 5
+  }
+}
+
+！！！！！！！！！！！！！！！！！！！把config.json.example文件后缀example删了然后改！！！！！！！！！！！！！！！！！！！
