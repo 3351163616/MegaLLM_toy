@@ -8,6 +8,7 @@ import threading
 import os
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from browser_handler import BrowserSession, CookieManager
 
 
 class ProxyPool:
@@ -329,8 +330,8 @@ def generate_password():
     return ''.join(password_chars)
 
 
-def signup_account(config, email, referral_code, proxies=None):
-    """注册账号，带重试机制"""
+def signup_account(config, email, referral_code, proxies=None, cookies=None):
+    """注册账号，带重试机制和浏览器验证支持"""
     api_base = config.get('api_base', 'https://megallm.io')
     signup_url = f"{api_base}/api/auth/signup"
     max_retries = config.get('retry', {}).get('max_retries', 5)
@@ -352,14 +353,37 @@ def signup_account(config, email, referral_code, proxies=None):
     print(f"  密码: {password}")
     print(f"  邀请码: {referral_code}")
 
+    # 设置请求头
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+
+    # 使用 session 来管理 cookies
+    session = requests.Session()
+    if cookies:
+        session.cookies.update(cookies)
+
     retry_count = 0
     while retry_count < max_retries:
         try:
             print(f"\n发起注册请求... (尝试 {retry_count + 1}/{max_retries})")
-            response = requests.post(signup_url, json=payload, proxies=proxies)
-            
+            response = session.post(signup_url, json=payload, proxies=proxies, headers=headers, timeout=30)
+
             print(f"响应状态码: {response.status_code}")
-            
+
+            # 检查是否遇到安全验证
+            if 'checkpoint' in response.url.lower() or 'verifying your browser' in response.text.lower():
+                print("⚠️  检测到 Vercel 安全检查点，需要浏览器验证")
+                return {
+                    "email": email,
+                    "password": password,
+                    "name": name,
+                    "success": False,
+                    "need_browser_verification": True
+                }
+
             # 检查状态码是否为200
             if response.status_code == 200:
                 data = response.json()
@@ -492,7 +516,7 @@ def extract_verification_code(emails):
     return None
 
 
-def verify_email(config, email, otp, proxies=None):
+def verify_email(config, email, otp, proxies=None, cookies=None):
     """验证邮箱"""
     api_base = config.get('api_base', 'https://megallm.io')
     verify_url = f"{api_base}/api/auth/verify"
@@ -507,14 +531,14 @@ def verify_email(config, email, otp, proxies=None):
     print(f"  验证码: {otp}")
 
     try:
-        response = requests.post(verify_url, json=payload, proxies=proxies)
+        response = requests.post(verify_url, json=payload, proxies=proxies, cookies=cookies)
         
         print(f"\n响应状态码: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
             print(f"响应内容: {data}")
-            
+
             # 检查verified字段
             if data.get('verified') == True:
                 print("\n✓ 邮箱验证成功!")
@@ -528,6 +552,11 @@ def verify_email(config, email, otp, proxies=None):
                 print(f"\n✗ 验证失败: verified={data.get('verified')}")
                 return {"success": False}
         else:
+            # 检查是否遇到安全验证
+            if 'checkpoint' in response.url.lower() or 'verifying your browser' in response.text.lower():
+                print("⚠️  检测到 Vercel 安全检查点，需要浏览器验证")
+                return {"success": False, "need_browser_verification": True}
+
             print(f"\n✗ 验证失败: 状态码{response.status_code}")
             print(f"响应内容: {response.text}")
             return {"success": False}
@@ -742,8 +771,8 @@ def get_random_referral_code(config):
         return code
 
 
-def register_once(config, proxy_pool=None, task_id=None):
-    """执行一次完整的注册流程"""
+def register_once(config, proxy_pool=None, task_id=None, cookie_manager=None):
+    """执行一次完整的注册流程，支持浏览器验证"""
     print("\n" + "="*60)
     print("开始新的注册流程")
     print("="*60)
@@ -763,6 +792,29 @@ def register_once(config, proxy_pool=None, task_id=None):
         else:
             print("⚠ 无可用代理，将不使用代理")
 
+    # 获取或生成 cookies
+    cookies = None
+    browser_session = None
+    if cookie_manager and config.get('browser', {}).get('enabled', True):
+        # 检查是否有缓存的有效 cookies
+        if not cookie_manager.is_expired(current_proxy, max_age=1800):  # 30分钟有效期
+            cached_data = cookie_manager.get_cookies(current_proxy)
+            if cached_data:
+                cookies = cached_data.get('cookies', {})
+                if cookies:
+                    print(f"🍪 使用缓存的 cookies (代理: {current_proxy or 'default'})")
+
+        # 如果没有有效 cookies，则通过浏览器获取
+        if not cookies:
+            print(f"🌐 通过浏览器获取新的验证 cookies...")
+            browser_session = BrowserSession(config)
+            cookies = browser_session.get_verified_session(current_proxy)
+            if cookies:
+                cookie_manager.set_cookies(cookies, current_proxy)
+                print(f"✅ 已保存 cookies 到缓存")
+            else:
+                print(f"⚠️  未能获取 cookies，将尝试直接请求")
+
     # 步骤1: 获取邀请码
     print("\n[步骤1] 获取邀请码...")
     referral_code = get_random_referral_code(config)
@@ -779,17 +831,31 @@ def register_once(config, proxy_pool=None, task_id=None):
 
     # 步骤3: 注册账号
     print("\n[步骤3] 注册账号...")
-    account_info = signup_account(config, email, referral_code, proxies=proxies)
+    account_info = signup_account(config, email, referral_code, proxies=proxies, cookies=cookies)
 
+    # 检查是否需要浏览器验证
     if not account_info['success']:
-        print("\n✗ 注册失败")
-        if proxy_pool and current_proxy:
-            proxy_pool.mark_proxy_failed(current_proxy)
-        return False
+        if account_info.get('need_browser_verification') and cookie_manager:
+            print("\n🔄 检测到需要浏览器验证，重新获取 cookies 后重试...")
+            # 清除旧的 cookies
+            cookie_manager.clear_cookies(current_proxy)
+            # 强制重新获取
+            browser_session = BrowserSession(config)
+            cookies = browser_session.get_verified_session(current_proxy)
+            if cookies:
+                cookie_manager.set_cookies(cookies, current_proxy)
+                # 重试注册
+                account_info = signup_account(config, email, referral_code, proxies=proxies, cookies=cookies)
+
+        if not account_info['success']:
+            print("\n✗ 注册失败")
+            if proxy_pool and current_proxy:
+                proxy_pool.mark_proxy_failed(current_proxy)
+            return False
 
     # 步骤4: 轮询邮箱获取验证码
     print("\n[步骤4] 轮询邮箱获取验证码...")
-    emails = poll_emails(config, email, proxies=proxies, timeout=600, poll_interval=5)
+    emails = poll_emails(config, email, proxies=proxies)
 
     if not emails:
         print("\n✗ 未收到验证邮件")
@@ -807,7 +873,7 @@ def register_once(config, proxy_pool=None, task_id=None):
 
     # 步骤6: 验证邮箱
     print("\n[步骤6] 验证邮箱...")
-    verify_result = verify_email(config, email, verification_code, proxies=proxies)
+    verify_result = verify_email(config, email, verification_code, proxies=proxies, cookies=cookies)
 
     if not verify_result['success']:
         print("\n✗ 邮箱验证失败")
@@ -856,6 +922,16 @@ def main():
     print("\n初始化代理池...")
     proxy_pool = ProxyPool(config)
 
+    # 初始化 Cookie 管理器
+    print("\n初始化 Cookie 管理器...")
+    cookie_manager = CookieManager('browser_cookies.json')
+    browser_enabled = config.get('browser', {}).get('enabled', True)
+    if browser_enabled:
+        print("✅ 浏览器验证已启用")
+    else:
+        print("⚠️  浏览器验证已禁用")
+        cookie_manager = None
+
     # 启动前健康检查
     print("\n执行启动前代理健康检查...")
     proxy_pool.health_check_all()
@@ -882,7 +958,7 @@ def main():
         """单个并发注册任务"""
         print(f"\n[任务 {task_id}] 开始执行...")
         try:
-            result = register_once(config, proxy_pool=proxy_pool, task_id=task_id)
+            result = register_once(config, proxy_pool=proxy_pool, task_id=task_id, cookie_manager=cookie_manager)
             return (task_id, result)
         except Exception as e:
             print(f"\n[任务 {task_id}] 异常: {e}")

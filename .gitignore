@@ -14,6 +14,7 @@ env/
 # 敏感数据文件 - 不要提交到仓库
 config.json
 accounts.csv
+browser_cookies.json
 
 # IDE 配置
 .vscode/

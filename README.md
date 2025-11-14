@@ -7,6 +7,11 @@
 - ✅ **临时邮箱**: 自动获取临时邮箱地址
 - ✅ **自动注册**: 自动完成账号注册流程
 - ✅ **邮箱验证**: 自动轮询邮箱获取验证码并完成验证
+- ✅ **浏览器自动验证**: 自动绕过 Vercel Security Checkpoint
+  - 使用 Playwright 模拟真实浏览器
+  - 自动完成安全验证挑战
+  - Cookies 缓存和复用机制
+  - 支持无头模式和可视化模式
 - ✅ **代理池管理**: 基于 Clash API 的智能代理池
   - 自动从 Clash API 获取代理节点列表
   - 并发健康检查，快速过滤不可用节点
@@ -28,26 +33,33 @@
 - Clash 代理客户端 (如 Clash Verge)
 - 依赖库:
   - requests
+  - playwright
 
 ## 安装
 
 1. 克隆仓库
 ```bash
-git clone <repository-url>
-cd small-toy
+git clone https://github.com/3351163616/MegaLLM_toy
+cd MegaLLM_toy
 ```
 
 2. 安装依赖
 ```bash
-pip install requests
+pip install -r requirements.txt
+```
+
+3. 安装 Playwright 浏览器
+```bash
+playwright install chromium
 ```
 
 或使用 uv:
 ```bash
 uv sync
+playwright install chromium
 ```
 
-3. 配置 Clash
+4. 配置 Clash
    - 确保 Clash 已启动
    - 开启 Clash API (External Controller)
    - 记录 API 地址和密钥
@@ -92,6 +104,12 @@ uv sync
   "email_polling": {
     "timeout": 600,
     "interval": 5
+  },
+
+  "browser": {
+    "enabled": true,
+    "headless": true,
+    "timeout": 30000
   }
 }
 ```
@@ -129,6 +147,11 @@ uv sync
 - `timeout`: 邮件轮询超时时间 (秒)
 - `interval`: 轮询间隔 (秒)
 
+#### 浏览器配置 (新增)
+- `enabled`: `true` 启用浏览器验证 / `false` 禁用
+- `headless`: `true` 无头模式 / `false` 显示浏览器窗口 (调试时推荐设为 false)
+- `timeout`: 浏览器操作超时时间 (毫秒)
+
 ## 使用方法
 
 ```bash
@@ -151,5 +174,27 @@ uv run main.py
 - `accounts.csv`: 注册成功的账号信息 (邮箱、密码、API Key)
 - `referral_pool.json`: 邀请码池数据 (启用邀请码池时)
 - `proxy_pool_state.json`: 代理池状态数据
+- `browser_cookies.json`: 浏览器验证 cookies 缓存
+
+## 浏览器验证说明
+
+本工具集成了 Playwright 自动化浏览器，可以自动绕过 Vercel Security Checkpoint：
+
+### 工作原理
+1. 首次运行或 cookies 过期时，自动启动浏览器
+2. 通过代理访问目标网站，完成 JavaScript 挑战验证
+3. 验证通过后提取 cookies 并缓存到本地
+4. 后续请求直接使用缓存的 cookies，无需重复验证
+5. cookies 默认有效期 30 分钟，过期后自动重新获取
+
+### 调试建议
+- 如遇验证问题，可设置 `browser.headless: false` 查看浏览器实际操作
+- 验证失败时会自动清除缓存并重试
+- 可通过 `browser_handler.py` 单独测试验证功能
+
+### 测试浏览器验证
+```bash
+python browser_handler.py
+```
 
 

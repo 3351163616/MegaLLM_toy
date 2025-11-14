@@ -13,7 +13,7 @@
   "proxy_pool": {
     "health_check_interval": 300,
     "max_failures": 3,
-    "concurrent_tasks": 20,
+    "concurrent_tasks": 5,
     "test_url": "http://www.gstatic.com/generate_204"
   },
   "referral_pool": {
@@ -27,6 +27,11 @@
   "email_polling": {
     "timeout": 600,
     "interval": 5
+  },
+  "browser": {
+    "enabled": true, //是否启用浏览器自动验证（绕过Vercel安全检查）
+    "headless": true, //无头模式，设为false可看到浏览器操作过程
+    "timeout": 60000 //浏览器操作超时时间（毫秒）
   }
 }
 
